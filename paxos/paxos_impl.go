@@ -2,7 +2,6 @@ package paxos
 
 import (
 	"errors"
-	"fmt"
 	"net"
 	"net/http"
 	"net/rpc"
@@ -12,6 +11,10 @@ import (
 
 var PROPOSE_TIMEOUT = 15 * time.Second
 
+type acceptedValue struct {
+	proposalNumber int
+	value          interface{}
+}
 type paxosNode struct {
 	// TODO: implement this!
 	myHostPort            string
@@ -23,6 +26,8 @@ type paxosNode struct {
 	proposalNumberKeyPair map[string]int
 	myConnection          *rpc.Client
 	minProposal           int //previous min Accepted Proposal
+	kvDb                  map[string]interface{}
+	acceptedValuesLog     map[string]*acceptedValue
 }
 
 func (pn *paxosNode) prepareHandler(args *paxosrpc.ProposeArgs, prepareChan chan *paxosrpc.PrepareReply, conn *rpc.Client) {
@@ -39,26 +44,128 @@ func (pn *paxosNode) prepareHandler(args *paxosrpc.ProposeArgs, prepareChan chan
 	}
 }
 
-func (pn *paxosNode) proposerHandler(args *paxosrpc.ProposeArgs, reply *paxosrpc.ProposeReply, done chan error) {
+func (pn *paxosNode) acceptHandler(key string, n int, v interface{}, conn *rpc.Client, acceptChan chan *paxosrpc.AcceptReply) {
+	acceptPacket := &paxosrpc.AcceptArgs{
+		Key:         key,
+		N:           n,
+		V:           v,
+		RequesterId: pn.ID}
+	var reply1 paxosrpc.AcceptReply
+	err := conn.Call("PaxosNode.RecvAccept", acceptPacket, &reply1)
+	if err != nil {
+		acceptChan <- nil
+	} else {
+		acceptChan <- &reply1
+	}
 
-	// PHASE 1: Send prepare packets to all Acceptors
+}
+func (pn *paxosNode) commitHandler(key string, v interface{}, conn *rpc.Client, commitChan chan *paxosrpc.CommitReply) {
+	commitPacket := &paxosrpc.CommitArgs{
+		Key:         key,
+		V:           v,
+		RequesterId: pn.ID}
+	var reply1 paxosrpc.CommitReply
+	err := conn.Call("PaxosNode.RecvCommit", commitPacket, &reply1)
+	if err != nil {
+		commitChan <- nil
+	} else {
+		commitChan <- &reply1
+	}
+
+}
+
+func (pn *paxosNode) proposerHandler(args *paxosrpc.ProposeArgs, reply *paxosrpc.ProposeReply, done chan error) {
+	key := args.Key
+	proposalNumber := args.N
+	value := args.V
+
+	//========== P H A S E 1 ===============================================================================//
+
+	// PHASE 1: Brodcasting Prepare Packet//
 	prepareChan := make(chan *paxosrpc.PrepareReply)
 	for _, conn := range pn.clients {
 		go pn.prepareHandler(args, prepareChan, conn)
 	}
-	// PHASE 1 REPLY: Handling replty of prepare packets
+	promise := 0
+	currentHighestNumber := -1
+
+	// PHASE 1 REPLY: Handling reply of prepare packets
 	for {
 		prepareReply := <-prepareChan
 		if prepareReply == nil {
 			done <- errors.New("PrepareHandler threw an error.")
-			break
+			return
 		}
-		if prepareReply.Status == paxosrpc.OK {
-			if prepareReply.N_a == -1 {
-				fmt.Println("Working..")
+		if prepareReply.Status == paxosrpc.Reject {
+			done <- errors.New("Prepare Packet Rejected")
+			return
+		} else {
+			promise++
+			if prepareReply.N_a > currentHighestNumber && prepareReply.V_a != nil {
+				value = prepareReply.V_a
+				currentHighestNumber = prepareReply.N_a
+			}
+
+			if promise >= pn.majorityNodes {
+				break
+			}
+
+		}
+	}
+	//======================================================================================================//
+
+	//========== P H A S E 2 ===============================================================================//
+
+	//PHASE 2: Broadcasting Accept Packet..
+	acceptChan := make(chan *paxosrpc.AcceptReply)
+	for _, conn := range pn.clients {
+		go pn.acceptHandler(key, proposalNumber, value, conn, acceptChan)
+	}
+
+	// PHASE 2 REPLY: Handling reply of accept packets
+	accept := 0
+	for {
+		acceptReply := <-acceptChan
+		if acceptChan == nil {
+			done <- errors.New("Accept error")
+			return
+		} else if acceptReply.Status == paxosrpc.Reject {
+			done <- errors.New("Accept Packet Rejected")
+			return
+		} else {
+			accept++
+			if accept >= pn.majorityNodes {
+				break
 			}
 		}
 	}
+	//======================================================================================================//
+
+	//========== P H A S E 3 ===============================================================================//
+
+	//PHASE 3: Broadcasting Commit Packet..
+	commitChan := make(chan *paxosrpc.CommitReply)
+	for _, conn := range pn.clients {
+		go pn.commitHandler(key, value, conn, commitChan)
+	}
+
+	// PHASE 3 REPLY: Handling reply of accept packets
+	commit := 0
+	for {
+		commitReply := <-commitChan
+		if commitReply == nil {
+			done <- errors.New("Commit Packet Error")
+			return
+		} else {
+			commit++
+			if commit >= pn.numNodes {
+				reply.V = value
+				done <- nil
+				return
+			}
+		}
+	}
+	//========================================================================================================//
 }
 
 // Desc:
@@ -84,38 +191,36 @@ func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvId, nu
 		majorityNodes:         numNodes/2 + 1,
 		proposalNumber:        srvId * 50,
 		proposalNumberKeyPair: make(map[string]int),
-		minProposal:           -1}
-	// clients:               make([]*rpc.Client)}
+		kvDb:              make(map[string]interface{}),
+		minProposal:       -1,
+		acceptedValuesLog: make(map[string]*acceptedValue)}
 
 	listener, err := net.Listen("tcp", myHostPort)
 	if err != nil {
-		fmt.Println("Error...")
+		// fmt.Println("Error...")
 		return nil, err
 	}
-	fmt.Println("Server ", srvId, " is listening...")
+	// fmt.Println("Server ", srvId, " is listening...")
 	rpc.RegisterName("PaxosNode", paxosrpc.Wrap(pn))
 	rpc.HandleHTTP()
 	go http.Serve(listener, nil)
-	// index := 0
 	for id, s := range hostMap {
 		for i := 1; i <= numRetries; i++ {
 			conn, err := rpc.DialHTTP("tcp", s)
 			if srvId == id {
 				pn.myConnection = conn
-				break
 			}
 			if err != nil {
 				time.Sleep(1 * time.Second)
 			} else {
 				pn.clients = append(pn.clients, conn)
-				fmt.Println("Server ", srvId, " made a successfull connection with server", id)
+				// fmt.Println("Server ", srvId, " made a successfull connection with server", id)
 				break
 			}
 			if i == numRetries {
 				return nil, errors.New("Server Dead: " + s)
 			}
 		}
-		// index++
 	}
 	return pn, nil
 }
@@ -146,7 +251,7 @@ func (pn *paxosNode) GetNextProposalNumber(args *paxosrpc.ProposalNumberArgs, re
 // reply: value that was actually committed for the given key
 func (pn *paxosNode) Propose(args *paxosrpc.ProposeArgs, reply *paxosrpc.ProposeReply) error {
 
-	fmt.Println(pn.ID)
+	// fmt.Println("Proposing ID: ", pn.ID)
 	done := make(chan error, 1)
 	go pn.proposerHandler(args, reply, done)
 	select {
@@ -155,8 +260,6 @@ func (pn *paxosNode) Propose(args *paxosrpc.ProposeArgs, reply *paxosrpc.Propose
 	case <-time.After(PROPOSE_TIMEOUT):
 		return errors.New("TimeOut Error")
 	}
-
-	return nil
 }
 
 // Desc:
@@ -167,7 +270,15 @@ func (pn *paxosNode) Propose(args *paxosrpc.ProposeArgs, reply *paxosrpc.Propose
 // args: the key to check
 // reply: the value and status for this lookup of the given key
 func (pn *paxosNode) GetValue(args *paxosrpc.GetValueArgs, reply *paxosrpc.GetValueReply) error {
-	return errors.New("not implemented")
+	value, flag := pn.kvDb[args.Key]
+	// fmt.Println("getValue", args.Key, pn.ID, value)
+	if flag {
+		reply.Status = paxosrpc.KeyFound
+		reply.V = value
+	} else {
+		reply.Status = paxosrpc.KeyNotFound
+	}
+	return nil
 }
 
 // Desc:
@@ -180,11 +291,23 @@ func (pn *paxosNode) GetValue(args *paxosrpc.GetValueArgs, reply *paxosrpc.GetVa
 // args: the Prepare Message, you must include RequesterId when you call this API
 // reply: the Prepare Reply Message
 func (pn *paxosNode) RecvPrepare(args *paxosrpc.PrepareArgs, reply *paxosrpc.PrepareReply) error {
-	// never accepted
+	// Case 1: Never Accepted
 	if pn.minProposal == -1 {
 		reply.Status = paxosrpc.OK
 		reply.N_a = -1
 		reply.V_a = nil
+		return nil
+	}
+	// Case 2: Already Accepted
+	av, exist := pn.acceptedValuesLog[args.Key]
+	if exist {
+		if args.N > av.proposalNumber {
+			reply.N_a = av.proposalNumber
+			reply.V_a = av.value
+			reply.Status = paxosrpc.OK
+		} else {
+			reply.Status = paxosrpc.Reject
+		}
 	}
 	return nil
 }
@@ -199,7 +322,28 @@ func (pn *paxosNode) RecvPrepare(args *paxosrpc.PrepareArgs, reply *paxosrpc.Pre
 // args: the Please Accept Message, you must include RequesterId when you call this API
 // reply: the Accept Reply Message
 func (pn *paxosNode) RecvAccept(args *paxosrpc.AcceptArgs, reply *paxosrpc.AcceptReply) error {
-	return errors.New("not implemented")
+	// Case 1: No value is accepted
+	if pn.minProposal == -1 {
+		pn.acceptedValuesLog[args.Key] = &acceptedValue{
+			proposalNumber: args.N,
+			value:          args.V}
+		reply.Status = paxosrpc.OK
+		return nil
+	}
+
+	// Case 2: Already Accepted Value
+	av, exist := pn.acceptedValuesLog[args.Key]
+	if exist {
+		if args.N >= av.proposalNumber {
+			pn.acceptedValuesLog[args.Key] = &acceptedValue{
+				proposalNumber: args.N,
+				value:          args.V}
+			reply.Status = paxosrpc.OK
+		} else {
+			reply.Status = paxosrpc.Reject
+		}
+	}
+	return nil
 }
 
 // Desc:
@@ -211,7 +355,11 @@ func (pn *paxosNode) RecvAccept(args *paxosrpc.AcceptArgs, reply *paxosrpc.Accep
 // args: the Commit Message, you must include RequesterId when you call this API
 // reply: the Commit Reply Message
 func (pn *paxosNode) RecvCommit(args *paxosrpc.CommitArgs, reply *paxosrpc.CommitReply) error {
-	return errors.New("not implemented")
+	// fmt.Println("Server: ", pn.ID, " Writing a value.", args.Key, args.V)
+	key := args.Key
+	value := args.V
+	pn.kvDb[key] = value
+	return nil
 }
 
 // Desc:

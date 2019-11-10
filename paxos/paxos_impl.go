@@ -22,6 +22,43 @@ type paxosNode struct {
 	clients               []*rpc.Client
 	proposalNumberKeyPair map[string]int
 	myConnection          *rpc.Client
+	minProposal           int //previous min Accepted Proposal
+}
+
+func (pn *paxosNode) prepareHandler(args *paxosrpc.ProposeArgs, prepareChan chan *paxosrpc.PrepareReply, conn *rpc.Client) {
+	preparePacket := &paxosrpc.PrepareArgs{
+		Key:         args.Key,
+		N:           args.N, //proposal Number
+		RequesterId: pn.ID}
+	var reply1 paxosrpc.PrepareReply
+	err := conn.Call("PaxosNode.RecvPrepare", preparePacket, &reply1)
+	if err != nil {
+		prepareChan <- nil
+	} else {
+		prepareChan <- &reply1
+	}
+}
+
+func (pn *paxosNode) proposerHandler(args *paxosrpc.ProposeArgs, reply *paxosrpc.ProposeReply, done chan error) {
+
+	// PHASE 1: Send prepare packets to all Acceptors
+	prepareChan := make(chan *paxosrpc.PrepareReply)
+	for _, conn := range pn.clients {
+		go pn.prepareHandler(args, prepareChan, conn)
+	}
+	// PHASE 1 REPLY: Handling replty of prepare packets
+	for {
+		prepareReply := <-prepareChan
+		if prepareReply == nil {
+			fmt.Println("Working")
+			break
+		}
+		if prepareReply.Status == paxosrpc.OK {
+			if prepareReply.N_a == -1 {
+				fmt.Println("Working..")
+			}
+		}
+	}
 }
 
 // Desc:
@@ -38,7 +75,6 @@ type paxosNode struct {
 // numNodes: the number of nodes in the ring
 // numRetries: if we can't connect with some nodes in hostMap after numRetries attempts, an error should be returned
 // replace: a flag which indicates whether this node is a replacement for a node which failed.
-
 func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvId, numRetries int, replace bool) (PaxosNode, error) {
 	pn := &paxosNode{
 		// personal info
@@ -47,7 +83,8 @@ func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvId, nu
 		numNodes:              numNodes,
 		majorityNodes:         numNodes/2 + 1,
 		proposalNumber:        srvId * 50,
-		proposalNumberKeyPair: make(map[string]int)}
+		proposalNumberKeyPair: make(map[string]int),
+		minProposal:           -1}
 	// clients:               make([]*rpc.Client)}
 
 	listener, err := net.Listen("tcp", myHostPort)
@@ -109,16 +146,9 @@ func (pn *paxosNode) GetNextProposalNumber(args *paxosrpc.ProposalNumberArgs, re
 // reply: value that was actually committed for the given key
 func (pn *paxosNode) Propose(args *paxosrpc.ProposeArgs, reply *paxosrpc.ProposeReply) error {
 
-	preparePacket := &paxosrpc.PrepareArgs{
-		Key:         args.Key,
-		N:           args.N, //proposal Number
-		RequesterId: pn.ID}
-	var reply1 paxosrpc.PrepareReply
 	fmt.Println(pn.ID)
-	// send prepare packets to all acceptors
-	for _, conn := range pn.clients {
-		conn.Call("PaxosNode.RecvPrepare", preparePacket, &reply1)
-	}
+	done := make(chan error)
+	pn.proposerHandler(args, reply, done)
 	return nil
 }
 
@@ -143,7 +173,12 @@ func (pn *paxosNode) GetValue(args *paxosrpc.GetValueArgs, reply *paxosrpc.GetVa
 // args: the Prepare Message, you must include RequesterId when you call this API
 // reply: the Prepare Reply Message
 func (pn *paxosNode) RecvPrepare(args *paxosrpc.PrepareArgs, reply *paxosrpc.PrepareReply) error {
-	fmt.Println("Prepare", pn.ID)
+	// never accepted
+	if pn.minProposal == -1 {
+		reply.Status = paxosrpc.OK
+		reply.N_a = -1
+		reply.V_a = nil
+	}
 	return nil
 }
 

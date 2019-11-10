@@ -14,10 +14,14 @@ var PROPOSE_TIMEOUT = 15 * time.Second
 
 type paxosNode struct {
 	// TODO: implement this!
-	myHostPort    string
-	srvId         int
-	numNodes      int
-	majorityNodes int
+	myHostPort            string
+	ID                    int
+	numNodes              int
+	majorityNodes         int
+	proposalNumber        int
+	clients               []*rpc.Client
+	proposalNumberKeyPair map[string]int
+	myConnection          *rpc.Client
 }
 
 // Desc:
@@ -37,10 +41,15 @@ type paxosNode struct {
 
 func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvId, numRetries int, replace bool) (PaxosNode, error) {
 	pn := &paxosNode{
-		myHostPort:    myHostPort,
-		srvId:         srvId,
-		numNodes:      numNodes,
-		majorityNodes: numNodes/2 + 1}
+		// personal info
+		myHostPort:            myHostPort,
+		ID:                    srvId,
+		numNodes:              numNodes,
+		majorityNodes:         numNodes/2 + 1,
+		proposalNumber:        srvId * 50,
+		proposalNumberKeyPair: make(map[string]int)}
+	// clients:               make([]*rpc.Client)}
+
 	listener, err := net.Listen("tcp", myHostPort)
 	if err != nil {
 		fmt.Println("Error...")
@@ -50,13 +59,18 @@ func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvId, nu
 	rpc.RegisterName("PaxosNode", paxosrpc.Wrap(pn))
 	rpc.HandleHTTP()
 	go http.Serve(listener, nil)
-
+	// index := 0
 	for id, s := range hostMap {
 		for i := 1; i <= numRetries; i++ {
-			_, err := net.Dial("tcp", s)
+			conn, err := rpc.DialHTTP("tcp", s)
+			if srvId == id {
+				pn.myConnection = conn
+				break
+			}
 			if err != nil {
 				time.Sleep(1 * time.Second)
 			} else {
+				pn.clients = append(pn.clients, conn)
 				fmt.Println("Server ", srvId, " made a successfull connection with server", id)
 				break
 			}
@@ -64,6 +78,7 @@ func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvId, nu
 				return nil, errors.New("Server Dead: " + s)
 			}
 		}
+		// index++
 	}
 	return pn, nil
 }
@@ -76,8 +91,12 @@ func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvId, nu
 // Params:
 // args: the key to propose
 // reply: the next proposal number for the given key
+
 func (pn *paxosNode) GetNextProposalNumber(args *paxosrpc.ProposalNumberArgs, reply *paxosrpc.ProposalNumberReply) error {
-	return errors.New("not implemented")
+	pn.proposalNumberKeyPair[args.Key] = pn.proposalNumber
+	reply.N = pn.proposalNumberKeyPair[args.Key]
+	pn.proposalNumber++
+	return nil
 }
 
 // Desc:
@@ -89,7 +108,18 @@ func (pn *paxosNode) GetNextProposalNumber(args *paxosrpc.ProposalNumberArgs, re
 // args: the key, value pair to propose together with the proposal number returned by GetNextProposalNumber
 // reply: value that was actually committed for the given key
 func (pn *paxosNode) Propose(args *paxosrpc.ProposeArgs, reply *paxosrpc.ProposeReply) error {
-	return errors.New("not implemented")
+
+	preparePacket := &paxosrpc.PrepareArgs{
+		Key:         args.Key,
+		N:           args.N, //proposal Number
+		RequesterId: pn.ID}
+	var reply1 paxosrpc.PrepareReply
+	fmt.Println(pn.ID)
+	// send prepare packets to all acceptors
+	for _, conn := range pn.clients {
+		conn.Call("PaxosNode.RecvPrepare", preparePacket, &reply1)
+	}
+	return nil
 }
 
 // Desc:
@@ -113,7 +143,8 @@ func (pn *paxosNode) GetValue(args *paxosrpc.GetValueArgs, reply *paxosrpc.GetVa
 // args: the Prepare Message, you must include RequesterId when you call this API
 // reply: the Prepare Reply Message
 func (pn *paxosNode) RecvPrepare(args *paxosrpc.PrepareArgs, reply *paxosrpc.PrepareReply) error {
-	return errors.New("not implemented")
+	fmt.Println("Prepare", pn.ID)
+	return nil
 }
 
 // Desc:

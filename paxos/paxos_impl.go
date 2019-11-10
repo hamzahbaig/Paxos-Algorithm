@@ -50,7 +50,7 @@ func (pn *paxosNode) proposerHandler(args *paxosrpc.ProposeArgs, reply *paxosrpc
 	for {
 		prepareReply := <-prepareChan
 		if prepareReply == nil {
-			fmt.Println("Working")
+			done <- errors.New("PrepareHandler threw an error.")
 			break
 		}
 		if prepareReply.Status == paxosrpc.OK {
@@ -147,8 +147,15 @@ func (pn *paxosNode) GetNextProposalNumber(args *paxosrpc.ProposalNumberArgs, re
 func (pn *paxosNode) Propose(args *paxosrpc.ProposeArgs, reply *paxosrpc.ProposeReply) error {
 
 	fmt.Println(pn.ID)
-	done := make(chan error)
-	pn.proposerHandler(args, reply, done)
+	done := make(chan error, 1)
+	go pn.proposerHandler(args, reply, done)
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(PROPOSE_TIMEOUT):
+		return errors.New("TimeOut Error")
+	}
+
 	return nil
 }
 

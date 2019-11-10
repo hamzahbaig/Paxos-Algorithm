@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/rpc"
 	"paxosapp/rpc/paxosrpc"
 	"time"
 )
@@ -12,7 +14,10 @@ var PROPOSE_TIMEOUT = 15 * time.Second
 
 type paxosNode struct {
 	// TODO: implement this!
-	name string
+	myHostPort    string
+	srvId         int
+	numNodes      int
+	majorityNodes int
 }
 
 // Desc:
@@ -31,23 +36,36 @@ type paxosNode struct {
 // replace: a flag which indicates whether this node is a replacement for a node which failed.
 
 func NewPaxosNode(myHostPort string, hostMap map[int]string, numNodes, srvId, numRetries int, replace bool) (PaxosNode, error) {
-	fmt.Println(myHostPort)
-	_, err := net.Listen("tcp", myHostPort)
+	pn := &paxosNode{
+		myHostPort:    myHostPort,
+		srvId:         srvId,
+		numNodes:      numNodes,
+		majorityNodes: numNodes/2 + 1}
+	listener, err := net.Listen("tcp", myHostPort)
 	if err != nil {
-		fmt.Println("error")
+		fmt.Println("Error...")
 		return nil, err
 	}
-	fmt.Println("listening server ID: ", srvId)
-	for id, s := range hostMap {
-		_, err := net.Dial("tcp", s)
-		if err != nil {
-			fmt.Println("Server is dead: ", id)
+	fmt.Println("Server ", srvId, " is listening...")
+	rpc.RegisterName("PaxosNode", paxosrpc.Wrap(pn))
+	rpc.HandleHTTP()
+	go http.Serve(listener, nil)
 
-		} else {
-			fmt.Println("My srvID: ", srvId, " Connection Successful with srvID: ", id)
+	for id, s := range hostMap {
+		for i := 1; i <= numRetries; i++ {
+			_, err := net.Dial("tcp", s)
+			if err != nil {
+				time.Sleep(1 * time.Second)
+			} else {
+				fmt.Println("Server ", srvId, " made a successfull connection with server", id)
+				break
+			}
+			if i == numRetries {
+				return nil, errors.New("Server Dead: " + s)
+			}
 		}
 	}
-	return nil, errors.New("not implemented")
+	return pn, nil
 }
 
 // Desc:
